@@ -1,0 +1,6 @@
+1. Test statemanagement (whether state gets deleted or updated as per conditions)
+2. Check is session_instances has key as session hash key
+3. Test if Unsuccessful auth works as expected
+4. Test if chat history in response has all the chats happened in that session till now or not. 
+
+more for collections and thread

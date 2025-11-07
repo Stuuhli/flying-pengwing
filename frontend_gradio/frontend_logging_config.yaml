@@ -1,0 +1,25 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  standard:
+    format: '%(levelname)4s [%(filename)s:%(lineno)d]:%(asctime)s:%(message)s'
+
+handlers:
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: standard
+    filename: __PLACEHOLDER__
+    maxBytes: 1000000
+    backupCount: 10
+
+loggers:
+  gradio_logger:
+    level: INFO
+    handlers: [file]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: [file]

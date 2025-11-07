@@ -1,0 +1,13 @@
+Bootstrap: docker
+From: python:3.12.3
+
+%files
+    ./app/main.py /app/main.py
+    requirements_frontend.txt /requirements_frontend.txt
+
+%post
+    pip install --no-cache-dir -r /requirements_frontend.txt
+
+%environment
+    # Set environment variables
+    export PYTHONPATH=/frontend_gradio

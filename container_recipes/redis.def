@@ -1,0 +1,13 @@
+Bootstrap: docker
+From: redis:alpine
+
+%post
+    apk add --no-cache bash
+    mkdir -p ./etc/redis
+    touch ./etc/redis/redis.conf
+    echo "bind 0.0.0.0" >> ./etc/redis/redis.conf
+    echo "dir ./user_data/" >> ./etc/redis/redis.conf
+
+
+%runscript
+    redis-server ./etc/redis/redis.conf

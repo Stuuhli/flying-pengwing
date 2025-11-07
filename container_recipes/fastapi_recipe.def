@@ -1,0 +1,17 @@
+Bootstrap: docker
+From: python:3.12.3
+
+%files
+    ./app/main.py /app/main.py
+    ./user_data/doc_store/ ./user_data/doc_store/
+    requirements.txt /requirements.txt
+
+%post
+    pip install --no-cache-dir -r /requirements.txt
+    pip install --no-cache-dir fastapi uvicorn
+
+%environment
+    # Set environment variables
+    export PYTHONPATH=/app
+
+

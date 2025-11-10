@@ -1,12 +1,21 @@
 from app.Ingestion_workflows.docling_parse_process import Docling_parser
 from app.Ingestion_workflows.milvus_ingest import ingest2milvus
 from app.RAG_workflows.citation_engine import CitationQueryEngineWorkflow
-from app.auth import password_verify
-from app.config import (USER_DB_PATH, MILVUS_URI, TOKEN,BACKEND_FASTAPI_LOG, RETRIEVAL_LOG_PATH, USER_HISTORY, USER_COLLECTION_MAPPING, CHAT_STORE_PATH,
+from app.auth import password_create
+from app.config import (MILVUS_URI, TOKEN,BACKEND_FASTAPI_LOG, RETRIEVAL_LOG_PATH, USER_HISTORY, CHAT_STORE_PATH,
                          MILVUS_ROOT_ROLE, BACKEND, VLLM_GEN_URL, GEN_CONTEXT_WINDOW, FILES_DB, FASTAPI_URL, col_mod, topk_mod, dim_mod, collection_type,
                            systemprompt, citation_header)
 from app.utils.utils_LLM import milvus_hybrid_retrieve, cite, log_retrievals 
-from app.utils.utils_auth import user_auth_format, write_json, load_json, user_auth_validate
+from app.utils.utils_auth import (
+    user_auth_format,
+    user_auth_validate,
+    authenticate_user,
+    build_user_profile,
+    create_user_record,
+)
+from app.utils.security import create_access_token, get_current_user, CurrentUser
+from app.db.database import get_db, init_db
+from sqlalchemy.orm import Session
 from app.utils.utils_backend import deserialize, cleanup_expired_sessions, check_chat_history_db, check_empty_chats
 from app.utils.utils_ingestion import FileUploadValidator, milvus_db_as_excel, ingest, get_doc_in_collection, check_admin
 from app.utils.utils_logging import initialize_logging, logger
@@ -47,6 +56,7 @@ async def lifespan(app: FastAPI):
     """ On starting up of the FastAPI server, this function initializes the ollama model and the user history tracker variable and file
     """
     logger.info(f" Initializing {BACKEND} and Redis")
+    init_db()
     # decode responses is False as manual decoding is necessary for some of the redis "get" commands
     app.state.redis = Redis(host='localhost', port=6379, db=0, decode_responses=False)
     if BACKEND=="ollama":
@@ -95,88 +105,156 @@ def health() -> Dict[str, str]:
 
 
 @app.post("/create_user")
-async def create_user(request : user_auth_format):
-    """ Create new user account by putting the data sent to API into an existing json using write_json function
-    """
-    logger.info(" Creating user: %s", request.username)
-    user_details= {"username": request.username,
-        "full_name": request.fullname,
-        "hashed_password": request.password,
-        "disabled": request.disabled,
-        "admin": request.admin}
-    write_json(username=request.username, new_data= user_details, filename=USER_DB_PATH)
-    logger.info(" User successfully created in DB: %s", request.username)
+async def create_user(request: user_auth_format, db: Session = Depends(get_db)):
+    """Create a new user account backed by the relational database."""
+
+    logger.info("Creating user with email: %s", request.email)
+    hashed_password = password_create(password=request.password).decode("utf-8")
+    try:
+        user = create_user_record(
+            db,
+            email=request.email,
+            hashed_password=hashed_password,
+            is_admin=request.is_admin,
+            rag_type=request.rag_type,
+            workspace_ids=request.workspace_ids,
+        )
+    except ValueError as exc:
+        logger.error("Failed to create user %s: %s", request.email, str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    profile = build_user_profile(user)
+    logger.info("User successfully created in DB: %s", request.email)
+    return {"message": "User created", "profile": profile.model_dump()}
 
 
-@app.post("/validate_user/{user}")
-async def validate_user(request: user_auth_validate):
-    # can also check if user exists in milvus, if not, create role if exist in user db
-    """ Validate username and entered password with the exisiting db. 
-    """
-    logger.info(" Validating: %s", request.username)
-    user_db= load_json(filename=request.USER_DB_PATH)
-    if request.username not in user_db:
-            logger.info("Invalid username or password ")
-            return "Invalid username or password", False
-    if not password_verify(password=request.password, hashed= user_db[request.username]["hashed_password"]):
-            logger.info("Invalid username or password ")
-            return "Invalid username or password", False
-    logger.info(" Validation successful for %s", request.username)
-    return "Successfully Authenticated.", True
+@app.post("/validate_user")
+async def validate_user(request: user_auth_validate, db: Session = Depends(get_db)):
+    """Validate credentials and issue a JWT for subsequent requests."""
+
+    logger.info("Validating credentials for: %s", request.email)
+    user = authenticate_user(db, email=request.email, password=request.password)
+    if not user:
+        logger.info("Invalid username or password for %s", request.email)
+        return {"message": "Invalid username or password", "success": False}
+
+    profile = build_user_profile(user)
+    permission_set = set(profile.permissions)
+    rag_type = "rag"
+    for candidate in ("rag", "graphrag"):
+        if candidate in permission_set:
+            rag_type = candidate
+            break
+    token = create_access_token(
+        subject=profile.email,
+        user_id=profile.id,
+        permissions=profile.permissions,
+        is_admin=profile.is_admin,
+        rag_type=rag_type,
+        workspaces=[workspace.id for workspace in profile.workspaces],
+    )
+
+    logger.info("Validation successful for %s", request.email)
+    return {
+        "message": "Successfully authenticated.",
+        "success": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "profile": profile.model_dump(),
+    }
 
 @app.post("/conversation/start")
-async def start_conversation(request: session_start_req, redis: Redis = Depends(lambda: app.state.redis)):
-    """ This function does initializations at the start of conversation. 
-        The state variables that are stored by redis include:
-        1. User history path and chat store paths
-        2. conversations tracker which is updated at the start and updates the db stored in user history path. It keeps track of which user-conversation id is the current api call for
-        3. session data: for a particular session id, store as a hash the user, passwrd, chat store object and citation engine object for later use
-    """
+async def start_conversation(
+    request: session_start_req,
+    redis: Redis = Depends(lambda: app.state.redis),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Initialise session specific state after validating workspace permissions."""
+
     logger.info(" Initializing session: %s for user %s", request.conv_id, request.username)
-    conversations= await redis.get("conversations")
-    conversations_dict= json.loads(conversations)
-    user_collection_db= Docling_parser.get_store(path=USER_COLLECTION_MAPPING)
-    list_of_conversations=[conv_id for conversations in conversations_dict.values() for conv_id in conversations]
+    if current_user.profile.email != request.username:
+        logger.error("Token subject mismatch for session: %s", request.conv_id)
+        raise HTTPException(status_code=403, detail="Token does not match requested user")
+
+    conversations = await redis.get("conversations")
+    conversations_dict = json.loads(conversations)
+    list_of_conversations = [conv_id for conversations in conversations_dict.values() for conv_id in conversations]
     if request.conv_id in list_of_conversations:
         logger.error(f"Invalid session: {request.conv_id}.  Already present in DB")
         raise HTTPException(status_code=401, detail="Invalid conv id. Already present in DB.")
-    # Initialize the chat store 
+
+    accessible_workspaces = {ws.id: ws for ws in current_user.profile.workspaces}
+    if not accessible_workspaces:
+        logger.error("User %s has no workspace assignments", request.username)
+        raise HTTPException(status_code=403, detail="No workspaces assigned to user")
+
+    selected_workspace_id = request.workspace_id or next(iter(accessible_workspaces.keys()))
+    if selected_workspace_id not in accessible_workspaces:
+        logger.error("Workspace %s not permitted for user %s", selected_workspace_id, request.username)
+        raise HTTPException(status_code=403, detail="Workspace access denied")
+
+    workspace_profile = accessible_workspaces[selected_workspace_id]
+    available_collections = {collection.name: collection for collection in workspace_profile.collections}
+    if not available_collections:
+        logger.error("Workspace %s has no collections assigned", workspace_profile.name)
+        raise HTTPException(status_code=403, detail="No collections available for workspace")
+
+    selected_collection = request.collection_name or next(iter(available_collections.keys()))
+    if selected_collection not in available_collections:
+        logger.error(
+            "Collection %s not permitted for user %s in workspace %s",
+            selected_collection,
+            request.username,
+            workspace_profile.name,
+        )
+        raise HTTPException(status_code=403, detail="Collection access denied")
+
     chat_store = SimpleChatStore()
-    # initialise memory buffer and serialise it
     memory = ChatMemoryBuffer.from_defaults(
         token_limit=14000,
         chat_store=chat_store,
         chat_store_key=request.conv_id,
     )
     serialized_memory = pickle.dumps(memory)
-    # store for each session, the username, password, chatstore and memory in redis
-    # TODO password encryption to make it secure
-    session_data= {
+    session_data = {
         "user_id": request.username,
         "password": request.password,
         "memory": serialized_memory,
-        "read_collection": user_collection_db[request.username],
-        "ingest_collection": ""
+        "read_collection": selected_collection,
+        "workspace_id": selected_workspace_id,
+        "token_claims": json.dumps(current_user.claims.model_dump(mode="json")),
+        "ingest_collection": "",
     }
-    await redis.hset(f"session:{request.conv_id}",mapping= session_data)
+    await redis.hset(f"session:{request.conv_id}", mapping=session_data)
     await redis.expire(f"session:{request.conv_id}", 10800)
     logger.info("Successfully set up session variables in Redis for session: %s ", request.conv_id)
-    # persist the new chat store for the user in the appropriate directory with name as conv id
-    deserialized_chat_store= deserialize(serialized_memory)
-    deserialized_chat_store= deserialized_chat_store.chat_store
-    chat_store_path= await redis.get("chat_store_path")
-    chat_store_path= chat_store_path.decode('utf-8')
-    deserialized_chat_store.persist(persist_path=chat_store_path.format(user= request.username, conv_id= request.conv_id))
-    # check if new user, then create new entry in conversations dict and finally append the new session id
+
+    deserialized_chat_store = deserialize(serialized_memory)
+    deserialized_chat_store = deserialized_chat_store.chat_store
+    chat_store_path = await redis.get("chat_store_path")
+    chat_store_path = chat_store_path.decode('utf-8')
+    deserialized_chat_store.persist(persist_path=chat_store_path.format(user=request.username, conv_id=request.conv_id))
+
     if request.username not in conversations_dict:
-        conversations_dict[request.username]=[]
+        conversations_dict[request.username] = []
     conversations_dict[request.username].append(request.conv_id)
     await redis.set("conversations", json.dumps(conversations_dict))
-    # persist the conversation tracker
     with open(USER_HISTORY, 'w') as fp:
         json.dump(conversations_dict, fp)
+
     logger.info("Started session: %s", request.conv_id)
-    return {"message": f"Conversation {request.conv_id} started", "user_collection": user_collection_db[request.username]}
+    return {
+        "message": f"Conversation {request.conv_id} started",
+        "workspace_id": selected_workspace_id,
+        "collection": selected_collection,
+        "available_workspaces": {
+            ws.id: {
+                "name": ws.name,
+                "collections": [collection.name for collection in ws.collections],
+            }
+            for ws in current_user.profile.workspaces
+        },
+    }
 
 @app.post("/conversation/{session_id_user}/message")
 async def add_message(session_id_user:str, request: Message_request, redis: Redis = Depends(lambda: app.state.redis)) -> str:

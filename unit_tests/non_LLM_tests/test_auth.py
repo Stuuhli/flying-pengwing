@@ -1,57 +1,74 @@
-from app.auth import password_create
-from app.utils.utils_auth import write_json, load_json
-from unit_tests.non_LLM_tests.conftest import TEST_DB_PATH
-from pathlib import Path
-
 def test_health(test_client):
-    """ Test if the connection is stable
-    """
+    """ Test if the connection is stable"""
     response = test_client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"health": "ok"}
 
-def test_validate_true(test_client, make_db):
-    """ For the correct login details, the response json should have True
-    """
-    payload= {
-        "username": make_db[list(make_db.keys())[0]]["username"],
-        "password": "test",
-        "USER_DB_PATH": TEST_DB_PATH
 
+def test_validate_true(test_client):
+    """Validate that a user can obtain a JWT with correct credentials."""
+    email = "test_user@example.com"
+    password = "test_password"
+    create_payload = {
+        "email": email,
+        "password": password,
+        "is_admin": False,
+        "rag_type": "rag",
+        "workspace_ids": [],
     }
-    response = test_client.post(f"/validate_user/{list(make_db.keys())[0]}", json= payload)
+    response_create = test_client.post("/create_user", json=create_payload)
+    assert response_create.status_code == 200
+
+    payload = {
+        "email": email,
+        "password": password,
+    }
+    response = test_client.post("/validate_user", json=payload)
     assert response.status_code == 200
-    assert response.json()[1] == True
+    body = response.json()
+    assert body["success"] is True
+    assert body["access_token"]
+    assert body["profile"]["email"] == email
 
-def test_validate_false(test_client, make_db):
-    """ For the wrong login details, the response json should have False
-    """
-    payload= {
-        "username": make_db[list(make_db.keys())[0]]["username"],
-        "password": "test_wrong",
-        "USER_DB_PATH": TEST_DB_PATH
 
+def test_validate_false(test_client):
+    """For wrong credentials validation should fail."""
+    email = "test_user_fail@example.com"
+    password = "correct_password"
+    create_payload = {
+        "email": email,
+        "password": password,
+        "is_admin": False,
+        "rag_type": "rag",
+        "workspace_ids": [],
     }
-    response = test_client.post(f"/validate_user/{list(make_db.keys())[0]}", json= payload)
+    response_create = test_client.post("/create_user", json=create_payload)
+    assert response_create.status_code == 200
+
+    payload = {
+        "email": email,
+        "password": "wrong_password",
+    }
+    response = test_client.post("/validate_user", json=payload)
     assert response.status_code == 200
-    assert response.json()[1] == False
+    body = response.json()
+    assert body["success"] is False
 
-def test_create_new_user(test_client):
-    """ send payload and check userdb for the exact payload with password match
-    """
-    payload_create= {
-        "username": "new_user",
-        "full_name": "new user",
-        "hashed_password": password_create("new_test").decode("utf-8"),
-        "disabled": False
+
+def test_create_duplicate_user(test_client):
+    """Creating the same user twice should return an error."""
+    email = "duplicate_user@example.com"
+    password = "duplicate_password"
+    create_payload = {
+        "email": email,
+        "password": password,
+        "is_admin": False,
+        "rag_type": "graphrag",
+        "workspace_ids": [],
     }
-    write_json(username=payload_create["username"], new_data=payload_create, filename=TEST_DB_PATH)
-    payload_valid= {
-        "username": payload_create["username"],
-        "password": "new_test",
-        "USER_DB_PATH": TEST_DB_PATH
-    }
-    response = test_client.post(f"/validate_user/{payload_create['username']}", json= payload_valid)
-    Path(TEST_DB_PATH).unlink()
-    assert response.status_code == 200
-    assert response.json()[1] == True
+    response_create = test_client.post("/create_user", json=create_payload)
+    assert response_create.status_code == 200
+
+    response_duplicate = test_client.post("/create_user", json=create_payload)
+    assert response_duplicate.status_code == 400
+    assert "already exists" in response_duplicate.json()["detail"].lower()

@@ -3,10 +3,8 @@ import cmd
 import os
 import requests
 import uuid
-from app.auth import password_create
-from app.config import API_CREATE_USER, API_VALIDATE_USER, API_CONV_START, API_CONV_SEND, API_GET_HISTORY, API_FILE_INGEST, API_LOGOUT, API_CHANGECOLLECTION, USER_DB_PATH, MILVUS_URI, MILVUS_USER_ROLE,MILVUS_ROOT_ROLE,col_mod  # noqa: F401
+from app.config import API_CREATE_USER, API_VALIDATE_USER, API_CONV_START, API_CONV_SEND, API_GET_HISTORY, API_FILE_INGEST, API_LOGOUT, API_CHANGECOLLECTION, MILVUS_URI, MILVUS_USER_ROLE, MILVUS_ROOT_ROLE, col_mod  # noqa: F401
 from app.Ingestion_workflows.milvus_RBAC import milvus_RBAC_manage
-from app.utils.utils_auth import load_json
 from rich import print
 from colorama import Fore, Style
 from pymilvus import MilvusClient
@@ -74,17 +72,19 @@ def get_user_collection_choice(collection_list: list):
         else:
             print("Invalid choice. Please try again.")
 
-def init_session(sess_id, username: str, password: str, collection_name: str):
-    """ Sends a post request to initialize chat memory and the session with the given session id 
+def init_session(sess_id, username: str, password: str, collection_name: str, workspace_id: int | None, token: str):
+    """ Sends a post request to initialize chat memory and the session with the given session id
     """
-    data= { 
+    data= {
                 "conv_id": str(sess_id),
                 "username": username,
                 "password": password,
-                "read_collection_name": collection_name
+                "workspace_id": workspace_id,
+                "collection_name": collection_name
                }
     try:
-        response = requests.post(API_CONV_START, json=data)
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.post(API_CONV_START, json=data, headers=headers)
         response.raise_for_status()
     except HTTPError as http_err:
         print(f"HTTP error occurred: {http_err}")
@@ -107,13 +107,6 @@ def validate_ingest_file(file_name: str):
         return False
     return True
 
-def check_user_DB(username: str):
-    db= load_json(USER_DB_PATH)
-    if username in db.keys():
-        return True
-    else:
-        return False
-
 class ChatCLI(cmd.Cmd):
     intro = "Please create new account by typing 'create' or login by typing 'validate <username>'\n Use ? to see list of available commands..\n"
     prompt = f"{Fore.YELLOW}User: {Style.RESET_ALL}"
@@ -127,6 +120,8 @@ class ChatCLI(cmd.Cmd):
         self.read_collection= "" # current collection to retrieve from
         self.ingest_collection= "" # current collection to ingest files into
         self.user_client= None # milvus client for user
+        self.access_token = ""
+        self.profile = None
 
     def do_create(self, args):
         """ Create account by entering user details, then request is sent to API to update DB with new user
@@ -134,11 +129,10 @@ class ChatCLI(cmd.Cmd):
         if self.authenticated:
             print("The 'create' command is already disabled after successful authentication.")
             return
-        self.username_create= input("Enter username: ")
-        full_name = input("Enter Full name: ")
+        self.username_create= input("Enter e-mail: ")
         password= input("Input password: ")
         password_re= input("Reinput password: ")
-        while True: 
+        while True:
             admin= input("Is this new user an admin? Y/N: ")
             if admin not in ["Y", "N", "y", "n"]:
                 print("Wrong input recieved")
@@ -147,30 +141,39 @@ class ChatCLI(cmd.Cmd):
                 if admin in ["Y", "y"]:
                     admin= True
                     role= MILVUS_ROOT_ROLE
-                else: 
+                else:
                     admin=False
                     role= MILVUS_USER_ROLE
                 break
+        while True:
+            rag_type = input("Assign access type (rag/graphrag): ").strip().lower()
+            if rag_type in ["rag", "graphrag"]:
+                break
+            print("Invalid input. Please enter 'rag' or 'graphrag'.")
+        workspace_raw = input("Workspace IDs (comma separated, leave empty for none): ").strip()
+        workspace_ids = []
+        if workspace_raw:
+            try:
+                workspace_ids = [int(item.strip()) for item in workspace_raw.split(",") if item.strip()]
+            except ValueError:
+                print("Workspace IDs must be integers.")
+                return True
         if password!=password_re:
             print("Password not matching, please try again!")
             return True
         elif len(password)<6:
             print("Enter password with 6 to 20 characters")
             return True
-        if check_user_DB(self.username_create):
-            print("Username already taken. Please use existing or choose another username")
-            return True
         print("Saving user details to database")
-        hashed_password= password_create(password=password_re).decode("utf-8")
-        data= { 
-                "username": self.username_create,
-                "fullname": full_name,
-                "password":hashed_password,
-                "disabled": False,
-                "admin": admin
+        data= {
+                "email": self.username_create,
+                "password": password_re,
+                "is_admin": admin,
+                "rag_type": rag_type,
+                "workspace_ids": workspace_ids,
                }
         try:
-            response = requests.post(API_CREATE_USER, 
+            response = requests.post(API_CREATE_USER,
                                     json=data)
             response.raise_for_status()
             # create user
@@ -189,50 +192,82 @@ class ChatCLI(cmd.Cmd):
 
     def do_validate(self, username):
         """ For the username, ask password and authenticate and then start the session.
-            Once session started, only chat, get_history and quit methods should be available. 
+            Once session started, only chat, get_history and quit methods should be available.
         """
         if self.authenticated:
             print("The 'validate' command is already disabled after successful authentication.")
             return
         password= input("Input password: ")
         data= {
-            "username": username,
+            "email": username,
             "password": password
         }
         try:
-            response = requests.post(API_VALIDATE_USER.format(user= username), 
-                                    json=data)
+            response = requests.post(API_VALIDATE_USER, json=data)
             response.raise_for_status()
         except HTTPError as http_err:
             print(f"HTTP error occurred: {http_err}")
         except Exception as err:
             print(f"Other error occurred: {err}")
         else:
-            print(response.json()[0])
-            if response.json()[1]: 
-                self.authenticated= True
+            body = response.json()
+            print(body.get("message", ""))
+            if body.get("success"):
+                self.authenticated = True
+                self.access_token = body.get("access_token", "")
+                self.profile = body.get("profile", {})
             else:
-                self.authenticated= False
+                self.authenticated = False
                 return True
+        if not self.authenticated:
+            return True
+
         self.session_id = uuid.uuid4()
-        if self.authenticated:
-            print("Choose collection from:")
-            self.user_client= show_client(username=username, password=password)
-            collection_list= self.user_client.list_collections()
-            if not collection_list:
-                print("No collections made yet, please create through admin role")
-                if MILVUS_ROOT_ROLE not in self.user_client.describe_user(user_name=username)["roles"]:
-                    return True
-                else: 
-                    collection_name= ""
-            else:
-                collection_name= get_user_collection_choice(collection_list=collection_list)
-        session_flag=init_session(sess_id=self.session_id, username=username, password= password, collection_name= collection_name)
+        self.username_current = username
+        self.user_client= show_client(username=username, password=password)
+
+        workspaces = (self.profile or {}).get("workspaces", [])
+        if not workspaces:
+            print("No workspaces assigned. Please contact an administrator.")
+            self.authenticated = False
+            return True
+
+        workspace_options = {i: ws for i, ws in enumerate(workspaces, start=1)}
+        while True:
+            print("Select a workspace:")
+            for idx, ws in workspace_options.items():
+                print(f"{idx}: {ws['name']} (ID: {ws['id']})")
+            try:
+                selection = int(input("Enter the number of your choice: "))
+            except Exception:
+                print("Invalid choice, please try again")
+                continue
+            if selection in workspace_options:
+                workspace = workspace_options[selection]
+                break
+            print("Invalid choice. Please try again.")
+
+        collections = workspace.get("collections", [])
+        if not collections:
+            print("The selected workspace has no collections. Contact an administrator.")
+            self.authenticated = False
+            return True
+
+        collection_name = get_user_collection_choice([col["name"] for col in collections])
+        workspace_id = workspace["id"]
+
+        session_flag = init_session(
+            sess_id=self.session_id,
+            username=username,
+            password=password,
+            collection_name=collection_name,
+            workspace_id=workspace_id,
+            token=self.access_token,
+        )
         if session_flag:
             return True
-        self.username_current = username
         self.read_collection= collection_name
-    
+
     # def do_change_collection(self, collection_name):
     #     """ Api to change collection midsession
 

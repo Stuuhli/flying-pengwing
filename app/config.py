@@ -8,11 +8,18 @@ parent_dir = os.path.dirname(script_dir)
 # Load .env variables
 load_dotenv(os.path.join(os.path.dirname(__file__), 'dev.env'))
 
+# Database configuration
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL is None:
+    DATABASE_URL = f"sqlite:///{os.path.join(parent_dir, 'app.db')}"
+
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change_me")
+JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
 # Session specific Databases
 USER_HISTORY = parent_dir+ os.environ.get("USER_HISTORY")
 CHAT_STORE_PATH = parent_dir + os.environ.get("CHAT_STORE_PATH")
-USER_DB_PATH = parent_dir + os.environ.get("USER_DB_PATH")
-USER_COLLECTION_MAPPING= parent_dir + os.environ.get("USER_COLLECTION_MAPPING")
 
 # Observability Databases
 RETRIEVAL_LOG_PATH= parent_dir + os.environ.get("RETRIEVAL_LOG_PATH")

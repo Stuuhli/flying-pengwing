@@ -5,6 +5,8 @@ class session_start_req(BaseModel):
     conv_id: str
     username: str
     password: str
+    workspace_id: int | None = None
+    collection_name: str | None = None
 
 class feedback_model(BaseModel):
     conv_id: str
